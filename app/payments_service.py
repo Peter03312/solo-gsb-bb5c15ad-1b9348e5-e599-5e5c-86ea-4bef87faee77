@@ -1,18 +1,30 @@
-"""付款登记、银行退回与权利人对账。
+"""付款登记、银行退回、预留额度占用与权利人对账。
 
 余额口径：全部期间已出具单据明细行（初次单与正负追补单）金额的代数和，
 减去全部已登记付款，再加上全部已登记银行退回。试算（preview）不出具、
 待处理播放不计入应付，因此二者天然不进入余额。
 
-并发协议（与出单互斥，杜绝超付/超退）：
+待确认预留：财务可凭"唯一指令号"为一笔付款预留正整数额度，预留一经创建
+即占用"可用额"。当前余额扣除**全部待确认预留**后的可用额才允许被新预留或
+新付款占用：
+
+    可用额 available = 当前余额 balance - 待确认预留总额 reserved_pending
+
+待确认预留既不进入单据累计也不是付款，故不改变 balance 本身，只缩小可用额。
+
+并发协议（与出单互斥，杜绝超付/超退/预留超额）：
 - 登记付款先取"外部流水号事务咨询锁"（序列化同一流水号的并发重试），
-  再对该权利人行取行锁；余额校验与付款插入在同一事务内原子完成。
+  再对该权利人行取行锁；可用额校验与付款插入在同一事务内原子完成。
+  （确认预留复用同一把流水号锁，保证"被其他付款占用的流水号"判定确定。）
+- 预留指令先取"指令号事务咨询锁"，确认时再取"外部付款流水号咨询锁"，
+  随后锁定权利人行；加锁次序统一为"指令号锁 -> 付款流水号锁（如有）
+  -> 权利人行锁"，无死锁。
 - 登记银行退回先取"退回流水号事务咨询锁"，再锁定原付款行
   （同一原付款的多笔并发退回在此串行，累计退回绝不合计超额），
   随后锁定权利人行（与付款/出单的余额校验互斥）。
 - 出单（statements_service）在写任何明细行前，按权利人编号排序锁定
-  本次受影响的全部权利人行。加锁次序统一为"付款/退回流水号咨询锁 →
-  付款行（仅退回）→ 按编号升序的权利人行"，无死锁。
+  本次受影响的全部权利人行。加锁次序统一为"付款/退回/指令流水号咨询锁 ->
+  付款行（仅退回）-> 按编号升序的权利人行"，无死锁。
 """
 import hashlib
 
@@ -29,6 +41,18 @@ def _ref_lock_key(external_ref: str) -> int:
     digest = hashlib.blake2b(external_ref.encode(), digest_size=8).digest()
     n = int.from_bytes(digest, "big", signed=False)
     return n - (1 << 64) if n >= (1 << 63) else n
+
+
+def lock_payment_ref(conn, external_ref: str) -> None:
+    """按外部付款流水号取事务咨询锁：同流水号的并发登记/确认在此串行化。
+
+    预留确认与直接付款登记共用同一把锁，因此"流水号已被其他付款占用"
+    的检查与插入原子、确定，不依赖 payments.external_ref 唯一约束竞态。
+    """
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(%s::bigint)",
+        (_combined_key(_PAYMENT_REF_NS, _ref_lock_key(external_ref)),),
+    )
 
 
 # 全部期间已出具单据的正负金额累计；追补差额为有符号值，直接代数相加。
@@ -77,6 +101,36 @@ def get_balance(conn, holder_code: str) -> int:
     )
 
 
+# 待确认预留总额：预留 pending 时占用额度，确认（转付款，付款再扣余额）
+# 或取消（释放）后即不再占用。可选 before_id 只统计"更早创建"的指令
+# （id 严格递增，代表创建次序；确认时必须为更早指令留足额度）。
+_RESERVED_PENDING_SQL = """
+SELECT COALESCE(SUM(amount), 0) AS reserved
+FROM payment_reservations
+WHERE holder_code = %s AND status = 'pending' {before}
+"""
+
+
+def get_reserved_pending(conn, holder_code: str, before_id: int | None = None) -> int:
+    """全部待确认预留总额；before_id 非空时只统计比它更早创建的指令。"""
+    if before_id is None:
+        row = conn.execute(
+            _RESERVED_PENDING_SQL.format(before=""),
+            (holder_code,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            _RESERVED_PENDING_SQL.format(before="AND id < %s"),
+            (holder_code, before_id),
+        ).fetchone()
+    return int(row["reserved"])
+
+
+def get_available(conn, holder_code: str) -> int:
+    """可用额 = 当前余额 - 全部待确认预留（可为负：负额追补冲减后）。"""
+    return get_balance(conn, holder_code) - get_reserved_pending(conn, holder_code)
+
+
 def lock_holders_for_billing(conn, holder_codes) -> None:
     """出单侧调用：按编号升序逐个锁定本次受影响的权利人，再写单据明细。
 
@@ -92,21 +146,18 @@ def lock_holders_for_billing(conn, holder_codes) -> None:
 
 
 def register_payment(conn, holder_code: str, external_ref: str, amount: int) -> dict:
-    """登记一笔已完成付款。
+    """登记一笔已完成付款（原接口：入参、响应与超额拒绝约定保持兼容）。
 
     - 权利人不存在：404 holder_not_found，不留付款；
     - 同一流水号同内容重试：返回原付款记录与登记后余额（幂等）；
     - 同一流水号异内容（权利人或金额不同）：409 payment_ref_conflict；
-    - 当前正余额不足（余额 <= 0 或 amount > balance）：
-      409 payment_exceeds_balance，拒绝且不留付款。
+    - 当前正余额不足，或可用额（余额扣除全部待确认预留后）不足：
+      409 payment_exceeds_balance，拒绝且不留付款。新付款须避开待确认预留。
     """
     with conn.transaction():
         # 先按流水号加锁：并发的同流水号请求在此串行化，
         # 避免唯一约束竞态下误报，也保证"同内容/异内容"判定确定。
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(%s::bigint)",
-            (_combined_key(_PAYMENT_REF_NS, _ref_lock_key(external_ref)),),
-        )
+        lock_payment_ref(conn, external_ref)
 
         existing = conn.execute(
             "SELECT id, holder_code, amount, created_at FROM payments WHERE external_ref = %s",
@@ -137,8 +188,15 @@ def register_payment(conn, holder_code: str, external_ref: str, amount: int) -> 
             raise _holder_not_found(holder_code)
 
         balance = get_balance(conn, holder_code)
-        if balance <= 0 or amount > balance:
+        if balance <= 0:
             raise _exceeds_balance(holder_code, amount, balance)
+        # 新付款须避开全部待确认预留：只可使用"余额 - 待确认预留"的可用额。
+        reserved = get_reserved_pending(conn, holder_code)
+        available = balance - reserved
+        if amount > available:
+            raise _exceeds_balance(
+                holder_code, amount, balance, reserved, available
+            )
 
         row = conn.execute(
             """
@@ -184,18 +242,31 @@ def _conflict(external_ref: str, existing) -> "object":
     )
 
 
-def _exceeds_balance(holder_code: str, amount: int, balance: int):
+def _exceeds_balance(
+    holder_code: str,
+    amount: int,
+    balance: int,
+    reserved: int = 0,
+    available: int | None = None,
+):
     from .errors import APIError
 
+    if available is None:
+        available = balance - reserved
     return APIError(
         409,
         "payment_exceeds_balance",
-        f"payment amount {amount} exceeds current positive balance {balance} "
+        f"payment amount {amount} exceeds current available amount {available} "
+        f"(balance {balance} minus pending reservations {reserved}) "
         f"of rightsholder {holder_code}; payment rejected",
         detail={
             "holder_code": holder_code,
             "requested_amount": amount,
             "balance": balance,
+            # 新增字段（旧客户端只取 balance 不受影响）：
+            # 待确认预留总额与扣除预留后的可用额
+            "reserved_pending": reserved,
+            "available": available,
         },
     )
 
@@ -243,9 +314,27 @@ def get_holder_ledger(conn, holder_code: str):
         (holder_code,),
     ).fetchall()
 
+    # 预留指令（全部状态）：待确认预留占用可用额，已确认携带付款流水号，
+    # 已取消保留留痕；按创建次序输出，历史指令不可改写。
+    reservation_rows = conn.execute(
+        """
+        SELECT v.id, v.instruction_ref, v.amount, v.status, v.created_at,
+               v.updated_at, p.external_ref AS payment_ref
+        FROM payment_reservations v
+        LEFT JOIN payments p ON p.id = v.payment_id
+        WHERE v.holder_code = %s
+        ORDER BY v.id
+        """,
+        (holder_code,),
+    ).fetchall()
+
     billed_total = sum(int(r["amount"]) for r in statement_rows)
     paid_total = sum(int(r["amount"]) for r in payment_rows)
     refunded_total = sum(int(r["amount"]) for r in refund_rows)
+    balance = billed_total - paid_total + refunded_total
+    reserved_total = sum(
+        int(r["amount"]) for r in reservation_rows if r["status"] == "pending"
+    )
 
     return {
         "holder_code": holder["code"],
@@ -253,7 +342,10 @@ def get_holder_ledger(conn, holder_code: str):
         "billed_total": billed_total,
         "paid_total": paid_total,
         "refunded_total": refunded_total,
-        "balance": billed_total - paid_total + refunded_total,
+        "balance": balance,
+        # 待确认预留总额与扣除预留后的可用额（权利人对账可见）
+        "reserved_total": reserved_total,
+        "available": balance - reserved_total,
         "statements": [
             {
                 "batch_id": r["batch_id"],
@@ -284,5 +376,20 @@ def get_holder_ledger(conn, holder_code: str):
                 "registered_at": r["created_at"],
             }
             for r in refund_rows
+        ],
+        "reservations": [
+            {
+                "reservation_id": r["id"],
+                "instruction_ref": r["instruction_ref"],
+                "amount": int(r["amount"]),
+                # pending（待确认，占用额度）/ confirmed（已确认，已登记付款）
+                # / cancelled（已取消，额度已释放）
+                "status": r["status"],
+                # 已确认指令的外部付款流水号；待确认/已取消为 None
+                "payment_ref": r["payment_ref"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            }
+            for r in reservation_rows
         ],
     }

@@ -304,6 +304,19 @@ class LedgerRefundItem(BaseModel):
     registered_at: datetime
 
 
+# 对账单中的预留指令条目（历史指令不可改写）
+class LedgerReservationItem(BaseModel):
+    reservation_id: int
+    instruction_ref: str
+    amount: int
+    # pending | confirmed | cancelled
+    status: str
+    # 已确认指令的外部付款流水号；待确认/已取消为 None
+    payment_ref: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class HolderLedger(BaseModel):
     holder_code: str
     name: str | None
@@ -316,10 +329,87 @@ class HolderLedger(BaseModel):
     # 当前余额 = billed_total - paid_total + refunded_total
     # （可为负：跨期负额追补后留待后续抵扣；退回只加回余额，不改变可负性）
     balance: int
+    # 待确认（pending）预留指令的额度合计：预留占用可用额，
+    # 确认后转为付款从余额扣减，取消后释放
+    reserved_total: int
+    # 可用额 = balance - reserved_total（新预留/新付款只能占用可用额）
+    available: int
     statements: list[LedgerStatementItem]
     payments: list[LedgerPaymentItem]
     # 逐笔银行退回（原付款与单据不可变，退回只追加）
     refunds: list[LedgerRefundItem]
+    # 全部预留指令（待确认/已确认/已取消），按创建次序；历史指令不可改写
+    reservations: list[LedgerReservationItem] = []
+
+
+# ---- 付款额度预留指令 ----
+
+class ReservationCreateIn(BaseModel):
+    # 权利人编号（须已建档；不存在 404 holder_not_found）
+    holder_code: str = Field(min_length=1, max_length=200)
+    # 唯一指令号（调用方提供，全局唯一）：同号同内容幂等、异内容 409
+    instruction_ref: str = Field(min_length=1, max_length=200)
+    # 正整数分额（最小货币单位）
+    amount: int = Field(strict=True, ge=1)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def reject_bool_amount(cls, v):
+        # JSON 的 true/false 虽是 int 子类，但不是合法金额
+        if isinstance(v, bool):
+            raise ValueError("amount must be an integer, not boolean")
+        return v
+
+
+class ReservationConfirmIn(BaseModel):
+    # 确认时提交的外部付款流水号（全局唯一）：
+    # 同流水号重试幂等；异流水号或被其他付款占用的流水号 409
+    external_ref: str = Field(min_length=1, max_length=200)
+
+
+class ReservationActionOut(BaseModel):
+    """创建预留 / 取消预留 / 查询单条指令的响应。"""
+    reservation_id: int
+    holder_code: str
+    instruction_ref: str
+    amount: int
+    # 操作状态：created=新创建/本次取消；duplicate=同号同内容或重复取消重试；
+    # 查询接口直接回显 pending/confirmed/cancelled
+    status: str
+    # 指令当前状态：pending（待确认，占用额度）| confirmed（已确认，已登记付款）
+    # | cancelled（已取消，额度已释放）
+    reservation_status: str
+    created_at: datetime
+    updated_at: datetime
+    # 当前余额（预留本身不扣余额；确认后余额才扣减）
+    balance: int
+    # 操作时该权利人的待确认预留总额（含 pending 状态的本指令）
+    reserved_pending: int
+    # 可用额 = balance - reserved_pending
+    available: int
+    # 已确认指令附带外部付款流水号；待确认/已取消为 None
+    payment_ref: str | None = None
+
+
+class ReservationConfirmOut(BaseModel):
+    """确认预留的响应：付款记录（沿用付款登记字段口径）与当前余额。"""
+    reservation_id: int
+    holder_code: str
+    instruction_ref: str
+    amount: int
+    # created=本次确认并登记付款；duplicate=同流水号幂等重试
+    status: str
+    # 指令当前状态：确认成功恒为 confirmed
+    reservation_status: str
+    # 原子登记的付款记录
+    payment_id: int
+    payment_ref: str
+    registered_at: datetime
+    confirmed_at: datetime
+    # 登记后余额（本笔付款已扣减）
+    balance_after: int
+    reserved_pending: int
+    available: int
 
 
 # ---- 银行退票（付款退回）登记 ----

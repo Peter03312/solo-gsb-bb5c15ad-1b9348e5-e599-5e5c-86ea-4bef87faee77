@@ -40,6 +40,34 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
   - 按权利人查询单据增减、付款流水、逐笔退回与余额（`/rightsholders/{code}/ledger`）；
   - 付款与出单/其他付款并发时，以「流水号事务咨询锁 + 权利人行锁（出单侧按编号升序加锁）」
     保证**校验与入账一致、绝不超付、无死锁**。
+- **付款额度预留指令（财务预留）**：
+  - 财务可凭**权利人编号、唯一指令号、正整数分额**预留付款额度；
+    只有「**当前余额扣除全部待确认预留后仍足额**」（`available >= amount`）才创建，
+    返回指令状态（`pending`）与当前余额、待确认预留总额、可用额；
+  - 同指令号**同内容重试幂等返回原指令**（`status=duplicate`，HTTP 200），
+    **异内容**（权利人或金额不同）返回 **409 `reservation_ref_conflict`**；
+    权利人不存在 404、金额非正整数 422、可用额不足 **409 `reservation_exceeds_balance`**，
+    拒绝时**不留任何预留**；
+  - 待确认指令可**取消**并立即释放额度（重复取消幂等；不存在 404
+    `reservation_not_found`；已确认不可取消 409 `reservation_not_pending`）；
+  - **确认**时提交外部付款流水号：在**同一事务内原子登记一笔现有付款并结束预留**
+    （`pending -> confirmed`），返回付款记录及登记后余额；**同流水号确认重试幂等**，
+    **异流水号、或流水号已被其他付款占用**返回 **409**（`reservation_ref_conflict` /
+    `payment_ref_conflict`）；
+  - **负额追补可能冲减余额**：确认时余额必须留足「**更早创建的待确认指令及本指令**
+    金额」（`balance >= 本指令金额 + 更早 pending 总额`，按指令 id 即创建次序），
+    否则 **409 `reservation_exceeds_balance` 且指令保持 `pending` 不变、不登记付款**；
+    更晚创建的预留不在留足范围内（更早指令优先）；
+  - **原付款登记接口入参/响应/超额拒绝约定保持兼容**：`POST /payments` 的新付款
+    必须**避开待确认预留**（只可使用 `余额 - 待确认预留` 的**可用额**；错误码仍为
+    `payment_exceeds_balance`，`detail` 新增 `reserved_pending`、`available`，
+    旧有 `balance` 字段不变）；**银行退回继续加回余额**；
+  - 权利人对账（ledger）新增 **`reserved_total`（待确认预留）、`available`（可用额）
+    与 `reservations[]`（全部指令及状态）**；预留指令与历史单据、付款一样
+    **一经写入不可改写**（除 `pending -> confirmed/cancelled` 受控迁移，触发器强制）；
+  - 并发协议：「**指令号事务咨询锁 → 外部付款流水号事务咨询锁（确认时，与直接付款
+    共用）→ 权利人行锁**」，同指令创建/确认串行、同流水号确认与直接付款不重复入账、
+    与出单/退回互斥，加锁次序统一、无死锁。
 - **银行退票（付款退回）登记（财务退票）**：
   - 财务收到银行退票时，凭 **原付款流水号、退回流水号、正整数分额** 登记退回，
     返回退回记录及登记后余额；**原付款和单据保持不可变**，退回只追加记录；
@@ -163,13 +191,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/statements?start=&end=` | 列出该期间全部单据及明细（含 `traceable` 可追溯标记） |
 | GET | `/statements/{batch_id}/attributions` | 按单据分页查询逐笔归因记录与逐权利人合计（可按 `holder_code` 过滤） |
 
-### 付款核对与银行退票
+### 付款核对、额度预留与银行退票
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/payments` | 登记已完成付款；新登记 201，同流水号同内容重试 200 返回原记录 |
+| POST | `/payments` | 登记已完成付款（新付款避开待确认预留）；新登记 201，同流水号同内容重试 200 返回原记录 |
+| POST | `/payment-reservations` | 凭权利人/唯一指令号/正整数分额预留额度；足额（可用额）才创建 201，同号同内容重试 200 |
+| POST | `/payment-reservations/{instruction_ref}/cancel` | 取消待确认指令并释放额度（重复取消幂等） |
+| POST | `/payment-reservations/{instruction_ref}/confirm` | 提交外部付款流水号，原子登记付款并结束预留；同流水号重试 200，首次 201 |
+| GET | `/payment-reservations/{instruction_ref}` | 查询单条预留指令状态与当时可用额（不存在 404） |
 | POST | `/refunds` | 登记银行退票（原付款流水号 + 退回流水号 + 正整数分额）；新登记 201，同退回流水号同内容重试 200 |
-| GET | `/rightsholders/{holder_code}/ledger` | 按权利人查询单据增减、付款流水、逐笔退回及当前余额（不存在 404） |
+| GET | `/rightsholders/{holder_code}/ledger` | 按权利人查询单据增减、付款流水、预留指令、逐笔退回、待确认预留、可用额及当前余额（不存在 404） |
 
 ### 银行回单核验
 
@@ -205,9 +237,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 幂等重试时 `status="duplicate"`、HTTP 200，`payment_id` 与原记录相同，
   `balance_after` 为**当前**余额；不产生第二笔付款。
 - 错误：同流水号异内容 → 409 `payment_ref_conflict`（响应 `detail` 回显原权利人/金额）；
-  余额不为正或超额 → 409 `payment_exceeds_balance`（`detail.balance` 为当时余额）；
-  权利人不存在 → 404 `holder_not_found`；金额为 0、负数或非整数 → 422。
-  上述拒绝均**不写入**任何付款。
+  余额不为正，或**可用额**（`balance` 扣除全部待确认预留后）不足 →
+  409 `payment_exceeds_balance`（`detail.balance` 为当时余额，另含
+  `reserved_pending`、`available`）；权利人不存在 → 404 `holder_not_found`；
+  金额为 0、负数或非整数 → 422。上述拒绝均**不写入**任何付款。
+  （入参与成功响应不变：新付款只是必须避开待确认预留。）
 
 `GET /rightsholders/{holder_code}/ledger` 响应要点：
 
@@ -215,11 +249,117 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `paid_total`：已登记付款累计（**保留付款总额，不因退票而冲减**）；
   `refunded_total`：已登记银行退回累计；
   `balance = billed_total − paid_total + refunded_total`（可为负）；
+- `reserved_total`：**待确认（pending）预留指令的额度合计**（预留只占用、不扣余额）；
+  `available = balance − reserved_total`：**可用额**（新预留/新付款只能占用可用额）；
 - `statements[]`：每张涉及该权利人的单据（`batch_id`、`kind`、期间、`amount` 带正负号、`issued_at`），
   按出具次序；`payments[]`：付款流水（`payment_id`、`external_ref`、`amount`、`registered_at`）；
+- `reservations[]`：**全部预留指令**（`reservation_id`、`instruction_ref`、`amount`、
+  `status`：`pending`/`confirmed`/`cancelled`、已确认指令的 `payment_ref`、
+  `created_at`/`updated_at`），按创建次序，历史指令不可改写；
 - `refunds[]`：**逐笔银行退回**（`refund_id`、`refund_ref`、`payment_id`、
   `payment_ref` 原付款流水号、`amount`、`registered_at`），按登记次序；
 - 试算与待处理播放不在内；负余额表示"历史付款暂未被后续正额抵扣完"，仍可核对。
+
+### 付款额度预留指令
+
+财务在付款真正发生前，可凭**权利人编号、唯一指令号（`instruction_ref`）与正整数分额**
+预留付款额度。待确认预留占用"可用额"：
+
+```
+可用额 available = 当前余额 balance − 全部待确认(pending)预留总额 reserved_pending
+```
+
+预留 pending 时**不改变余额**（既不是单据也不是付款）；确认时转为一笔付款（从余额扣减），
+取消则立即释放。创建请求 `POST /payment-reservations`：
+
+```json
+{ "holder_code": "RS-A", "instruction_ref": "INST-20260301-0001", "amount": 70 }
+```
+
+- 只有 `amount <= available` 才创建（HTTP 201，`status="created"`，
+  `reservation_status="pending"`），响应回显余额、待确认预留总额与可用额：
+
+```json
+{
+  "reservation_id": 1,
+  "holder_code": "RS-A",
+  "instruction_ref": "INST-20260301-0001",
+  "amount": 70,
+  "status": "created",
+  "reservation_status": "pending",
+  "created_at": "2026-03-01T09:00:00Z",
+  "updated_at": "2026-03-01T09:00:00Z",
+  "balance": 100,
+  "reserved_pending": 70,
+  "available": 30,
+  "payment_ref": null
+}
+```
+
+- 同指令号**同内容重试**：HTTP 200、`status="duplicate"`，返回原指令（无论其处于
+  pending/confirmed/cancelled），不重复创建、不改状态；
+  同指令号**异内容**（权利人或金额不同）：409 `reservation_ref_conflict`
+  （`detail` 回显原权利人/金额/状态）；权利人不存在 404 `holder_not_found`；
+  金额为 0、负数、非整数或布尔 422；可用额不足 409 `reservation_exceeds_balance`
+  （`detail` 含 `balance`、`reserved_pending`、`available`），拒绝时不留任何预留。
+
+**取消**：`POST /payment-reservations/{instruction_ref}/cancel`（无请求体）
+
+- 仅待确认指令可取消：取消即释放额度；首次返回 `status="cancelled"`（HTTP 200），
+  重复取消幂等返回 `status="duplicate"`（HTTP 200），响应字段同创建响应；
+- 指令不存在 → 404 `reservation_not_found`；指令已确认（无法取消）→
+  409 `reservation_not_pending`（`detail.state="confirmed"`）。
+
+**确认**：`POST /payment-reservations/{instruction_ref}/confirm`
+
+```json
+{ "external_ref": "BANK-20260301-0001" }
+```
+
+- 在**同一事务内原子登记一笔现有付款并结束预留**（`pending -> confirmed`）：
+  首次 HTTP 201、`status="created"`，返回付款记录及登记后余额；同流水号重试
+  HTTP 200、`status="duplicate"`、返回同一 `payment_id`，不重复入账：
+
+```json
+{
+  "reservation_id": 1,
+  "holder_code": "RS-A",
+  "instruction_ref": "INST-20260301-0001",
+  "amount": 70,
+  "status": "created",
+  "reservation_status": "confirmed",
+  "payment_id": 5,
+  "payment_ref": "BANK-20260301-0001",
+  "registered_at": "2026-03-01T10:00:00Z",
+  "confirmed_at": "2026-03-01T10:00:00Z",
+  "balance_after": 30,
+  "reserved_pending": 0,
+  "available": 30
+}
+```
+
+- 已确认指令提交**另一流水号** → 409 `reservation_ref_conflict`（回显原流水号与请求流水号）；
+  提交的流水号**已被其他付款占用**（其他直接付款或其他指令的确认）→
+  409 `payment_ref_conflict`（回显占用付款的编号/权利人/金额及占用它的预留）；
+  指令不存在 → 404 `reservation_not_found`；指令已取消 →
+  409 `reservation_not_pending`。
+- **负额追补保护（更早指令优先）**：确认时要求
+
+  ```
+  当前余额 balance >= 本指令金额 + 比本指令更早创建(id 更小)的待确认预留总额
+  ```
+
+  不满足则 409 `reservation_exceeds_balance`（`detail` 含 `balance`、
+  `earlier_pending_reservations`、`required`），**指令保持 pending 不变、不登记任何付款**；
+  比本指令更晚创建的预留**不在**留足范围内——余额只够更早指令时，更早指令可确认，
+  更晚指令被拒（可等待后续正额或取消）。
+- 查询单条指令：`GET /payment-reservations/{instruction_ref}`（字段同创建响应，
+  `status` 直接回显 `pending`/`confirmed`/`cancelled`；不存在 404）。
+
+> 预留指令一经写入即不可修改/删除：金额、权利人、指令号、创建时间不可变，
+> 终态（confirmed/cancelled）不可再改（数据库触发器强制，与付款/单据一致）。
+> 银行退回照旧加回余额，加回后的额度可用于确认或新预留；回单核验对确认登记的
+> 付款与直接付款一视同仁（仍按外部流水号对照）。
 
 ### 银行退票登记
 
@@ -381,7 +521,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## 调用示例
 
 一键演示脚本（请先启动服务），覆盖幂等、异内容拒绝、区间重叠、更正链/分叉拒绝、
-后补协议、逐笔分摊、初次单与正负追补单、待处理清单等全部场景：
+后补协议、逐笔分摊、初次单与正负追补单、待处理清单、付款额度预留/取消/确认等全部场景：
 
 ```bash
 bash examples/demo.sh
@@ -476,6 +616,50 @@ curl -sS -i -X POST http://localhost:8000/payments -H 'Content-Type: application
 # 对账单：单据增减（含负追补）、付款流水、billed/paid/balance
 curl -sS "http://localhost:8000/rightsholders/RS-A/ledger" | python3 -m json.tool
 ```
+
+财务付款真正发生前可先预留额度（承上：RS-A 单据累计 19 分时）：
+
+```bash
+# 1) 预留 10 分：余额 19 - 待确认预留 10 => available=9；201，reservation_status=pending
+curl -sS -X POST http://localhost:8000/payment-reservations -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","instruction_ref":"INST-20260301-0001","amount":10}' \
+  | python3 -m json.tool
+
+# 2) 同指令号同内容重试 => 200 status=duplicate 返回原指令；异内容 => 409
+curl -sS -X POST http://localhost:8000/payment-reservations -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","instruction_ref":"INST-20260301-0001","amount":10}'
+curl -sS -i -X POST http://localhost:8000/payment-reservations -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","instruction_ref":"INST-20260301-0001","amount":9}' | head -1
+
+# 3) 直接付款必须避开待确认预留：余额 19 但可用额仅 9，付 10 => 409（错误码兼容）
+curl -sS -i -X POST http://localhost:8000/payments -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","external_ref":"BANK-20260301-0099","amount":10}' | head -1
+
+# 4) 确认：提交外部付款流水号，原子登记付款并结束预留 => 201，balance_after=9
+curl -sS -X POST http://localhost:8000/payment-reservations/INST-20260301-0001/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260301-0100"}' | python3 -m json.tool
+
+# 5) 同流水号确认重试 => 200 duplicate；异流水号 / 被其他付款占用的流水号 => 409
+curl -sS -X POST http://localhost:8000/payment-reservations/INST-20260301-0001/confirm \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-20260301-0100"}'
+curl -sS -i -X POST http://localhost:8000/payment-reservations/INST-20260301-0001/confirm \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-OTHER"}' | head -1
+
+# 6) 取消另一笔待确认指令释放额度（重复取消幂等；已确认不可取消 409）
+curl -sS -X POST http://localhost:8000/payment-reservations -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","instruction_ref":"INST-20260301-0002","amount":5}' >/dev/null
+curl -sS -X POST http://localhost:8000/payment-reservations/INST-20260301-0002/cancel
+curl -sS -i -X POST http://localhost:8000/payment-reservations/INST-20260301-0001/cancel | head -1
+
+# 7) 单条指令查询；对账单可见 reserved_total / available / reservations[]
+curl -sS http://localhost:8000/payment-reservations/INST-20260301-0001 | python3 -m json.tool
+curl -sS http://localhost:8000/rightsholders/RS-A/ledger | python3 -m json.tool
+```
+
+> 负额追补冲减余额后确认预留：系统按指令创建次序，要求余额留足**更早的待确认指令与本指令**
+> 金额，不足时确认被拒且指令保持 `pending`（409 `reservation_exceeds_balance`），
+> 后续正额恢复后可再确认；更晚的预留不影响更早指令的确认。
 
 财务按批次导入银行回单，核验已登记付款（承上：BANK-20260301-0001 已付 RS-A 19 分）：
 
@@ -591,7 +775,12 @@ python3 -m unittest discover -s tests -v
 同付款多笔并发退回不合计超额/退回与付款及出单并发余额一致无死锁/
 对账单付款与退回总额分列）与回单核验（整批拒绝/幂等重试/异内容复用/跨批次重复回单/
 冻结结论与累计退回额/迟到付款及退回复核版本化/并发复核与并发导入/
-付款退回与复核并发快照一致/核验不改写账务）各有一套：
+付款退回与复核并发快照一致/核验不改写账务）各有一套；
+付款额度预留（可用额口径创建/同号幂等与异内容拒绝/取消释放与幂等/
+确认原子登记付款/同流水号幂等与异流水号及占用拒绝/负额追补下为更早预留留足、
+拒绝且指令不变/原付款接口避开待确认预留且兼容/退回加回余额/对账可见预留与可用额/
+指令不可改写触发器/同指令并发创建与确认、确认与直接付款抢同流水号不重复入账）
+再有一套：
 
 ```bash
 pip install pgserver httpx
@@ -600,6 +789,7 @@ PYTHONPATH=. python3 tests/integration_attribution.py    # 逐笔归因证据
 PYTHONPATH=. python3 tests/integration_payments.py       # 付款登记与权利人对账
 PYTHONPATH=. python3 tests/integration_refunds.py        # 银行退票登记与回单退回额冻结
 PYTHONPATH=. python3 tests/integration_receipts.py       # 银行回单批次导入与付款核验
+PYTHONPATH=. python3 tests/integration_reservations.py   # 付款额度预留指令
 ```
 
 ## 目录结构
@@ -612,7 +802,8 @@ app/
   allocation.py           # 逐笔按比例分摊（最大余数法 + 编号次序）
   schemas.py              # Pydantic 模型与输入校验
   statements_service.py   # 期间匹配、重算、初次/追补出具、并发互斥、逐笔归因冻结与分页对账
-  payments_service.py     # 付款登记（流水号锁/余额校验/幂等冲突）、权利人对账单、出单侧权利人行锁
+  payments_service.py     # 付款登记（流水号锁/可用额校验/幂等冲突）、预留占用与权利人对账单、出单侧权利人行锁
+  reservations_service.py # 付款额度预留（指令号锁 -> 流水号锁 -> 权利人行锁；创建/取消释放/确认原子登记付款，为更早预留留足）
   refunds_service.py      # 银行退票登记（退回流水号锁 + 原付款行锁 + 权利人行锁，累计超额拒绝/幂等冲突）
   receipts_service.py     # 回单批次导入（幂等/整批拒绝/跨批次去重）、核验结论与累计退回额冻结、复核版本化
   routers/
@@ -620,9 +811,10 @@ app/
     plays.py              # 播放导入、幂等、更正链
     statements.py         # 单据出具、试算、查询、逐笔归因分页查询
     payments.py           # 付款登记、按权利人对账
+    reservations.py       # 预留额度创建/取消/确认、单条指令查询
     refunds.py            # 银行退票登记
     receipts.py           # 回单批次导入、复核、版本查询
-examples/demo.sh          # 端到端 curl 示例（含银行退票登记与退回后复核）
-tests/                    # 单元测试与五套 pgserver 端到端集成测试
+examples/demo.sh          # 端到端 curl 示例（含付款额度预留与确认/取消）
+tests/                    # 单元测试与六套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```

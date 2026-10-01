@@ -266,4 +266,54 @@ $C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
 $C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
 $C "$BASE/receipts/RC-20260301-01/versions/1" | python3 -m json.tool
 
+say "38) 付款额度预留：凭权利人编号 + 唯一指令号 + 正整数分额（余额扣全部待确认预留后足额才创建）"
+# 承上：退票把 RS-B 的可用余额加回至 1。预留 1 分：可用额 1-1=0
+$C -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","instruction_ref":"INST-20260311-0001","amount":1}' \
+  | python3 -m json.tool
+# 同号同内容重试 => 幂等返回原指令(status=duplicate, HTTP 200)
+$C -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","instruction_ref":"INST-20260311-0001","amount":1}' \
+  | python3 -m json.tool
+# 同号异内容（金额不同）=> 409 reservation_ref_conflict
+$C -i -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","instruction_ref":"INST-20260311-0001","amount":2}' | head -1
+# 可用额已为 0：再预留 1 分 => 409 reservation_exceeds_balance（detail 含
+# balance / reserved_pending / available），不留任何预留
+$C -i -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","instruction_ref":"INST-20260311-0002","amount":1}' | head -1
+
+say "39) 新付款避开待确认预留：RS-B 余额 1 已被预留，直接付 1 => 409（错误码/字段兼容）"
+$C -i -X POST "$BASE/payments" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","external_ref":"BANK-20260311-1000","amount":1}' | head -1
+
+say "40) 确认预留：提交外部付款流水号，原子登记付款并结束预留，返回付款记录与余额"
+$C -X POST "$BASE/payment-reservations/INST-20260311-0001/confirm" \
+  -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260311-0001"}' | python3 -m json.tool
+# 同流水号确认重试 => 幂等返回原付款(status=duplicate, HTTP 200)，不重复入账
+$C -X POST "$BASE/payment-reservations/INST-20260311-0001/confirm" \
+  -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260311-0001"}' | python3 -m json.tool
+# 异流水号 => 409 reservation_ref_conflict；
+# 流水号被其他付款占用 => 409 payment_ref_conflict（用前文已登记的 BANK-20260302-0002）
+$C -i -X POST "$BASE/payment-reservations/INST-20260311-0001/confirm" \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-OTHER"}' | head -1
+
+say "41) 取消待确认指令释放额度（重复取消幂等；已确认指令不可取消 409）"
+# 先再造一笔待确认预留：RS-B 付款后余额 0，先登记一笔退回加回 1，再预留再取消
+$C -X POST "$BASE/refunds" -H 'Content-Type: application/json' \
+  -d '{"payment_ref":"BANK-20260311-0001","refund_ref":"BANK-RET-20260311-9001","amount":1}' \
+  | python3 -m json.tool
+$C -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","instruction_ref":"INST-20260311-0003","amount":1}' >/dev/null
+$C -X POST "$BASE/payment-reservations/INST-20260311-0003/cancel" | python3 -m json.tool
+$C -X POST "$BASE/payment-reservations/INST-20260311-0003/cancel" | python3 -m json.tool
+$C -i -X POST "$BASE/payment-reservations/INST-20260311-0001/cancel" | head -1
+$C -i -X POST "$BASE/payment-reservations/NO-SUCH-INSTRUCTION/cancel" | head -1
+$C "$BASE/payment-reservations/INST-20260311-0001" | python3 -m json.tool
+
+say "42) 权利人对账：待确认预留 reserved_total、可用额 available 与全部指令 reservations[]"
+$C "$BASE/rightsholders/RS-B/ledger" | python3 -m json.tool
+
 say "完成"

@@ -257,6 +257,77 @@ CREATE TRIGGER payment_refunds_frozen_trg
     BEFORE UPDATE OR DELETE ON payment_refunds
     FOR EACH ROW EXECUTE FUNCTION payment_refunds_frozen();
 
+-- 付款额度预留指令：财务凭"权利人编号 + 唯一指令号 + 正整数分额"预留付款额度。
+-- instruction_ref 全局唯一：同号同内容重试幂等返回原指令，同号异内容（权利人或
+-- 金额不同）拒绝（409）。指令生命周期：
+--   pending（待确认）-> confirmed（已确认：原子登记外部付款并结束预留）
+--                   -> cancelled（已取消：释放预留额度）
+-- 待确认期间金额计入"待确认预留总额"，当前余额扣除全部待确认预留后的"可用额"
+-- 才允许被新预留/新付款占用；确认时还须为更早创建的待确认指令留足额度
+-- （负额追补冲减余额时，不满足的确认被拒、指令保持 pending 不变）。
+CREATE TABLE IF NOT EXISTS payment_reservations (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    holder_code     text NOT NULL REFERENCES rightsholders(code),
+    instruction_ref text NOT NULL UNIQUE,
+    amount          bigint NOT NULL CHECK (amount > 0),
+    status          text NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'confirmed', 'cancelled')),
+    -- 确认时原子登记的付款；一笔付款至多终结一条预留（payment_id 唯一）
+    payment_id      bigint UNIQUE REFERENCES payments(id),
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT payment_reservations_status_payment_chk CHECK (
+        (status = 'pending'   AND payment_id IS NULL)
+        OR (status = 'confirmed' AND payment_id IS NOT NULL)
+        OR (status = 'cancelled' AND payment_id IS NULL)
+    )
+);
+-- 对账单按权利人列预留指令；确认时"更早创建的待确认指令"求和主索引
+CREATE INDEX IF NOT EXISTS payment_reservations_holder_idx
+    ON payment_reservations(holder_code, id);
+
+-- 预留指令除两条受控状态迁移（pending -> confirmed/cancelled）外不可变：
+-- 权利人、指令号、金额、创建时间一律不可改，已终结指令不可再改/取消，禁止删除
+-- （历史单据与付款不可改写，预留指令同样留痕）。
+CREATE OR REPLACE FUNCTION payment_reservations_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'payment reservations must never be deleted';
+    END IF;
+    IF OLD.status <> 'pending'
+       OR NEW.status NOT IN ('confirmed', 'cancelled')
+       OR NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.holder_code IS DISTINCT FROM OLD.holder_code
+       OR NEW.instruction_ref IS DISTINCT FROM OLD.instruction_ref
+       OR NEW.amount IS DISTINCT FROM OLD.amount
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'payment reservations are immutable except the controlled '
+                      || 'pending -> confirmed/cancelled transition';
+    END IF;
+    IF NEW.status = 'confirmed' THEN
+        IF NEW.payment_id IS NULL THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'check_violation',
+                MESSAGE = 'confirming a reservation requires a registered payment_id';
+        END IF;
+    ELSIF NEW.payment_id IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'check_violation',
+            MESSAGE = 'cancelling a reservation must not attach a payment';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS payment_reservations_guard_trg ON payment_reservations;
+CREATE TRIGGER payment_reservations_guard_trg
+    BEFORE UPDATE OR DELETE ON payment_reservations
+    FOR EACH ROW EXECUTE FUNCTION payment_reservations_guard();
+
 -- 单据的可追溯性标记：traceable（本轮起出具、带逐笔证据）；
 -- legacy_untraceable（升级前已存在、只有汇总明细行、无法逐笔追溯的存量单据）
 ALTER TABLE statement_batches
