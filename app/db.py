@@ -257,6 +257,75 @@ CREATE TRIGGER payment_refunds_frozen_trg
     BEFORE UPDATE OR DELETE ON payment_refunds
     FOR EACH ROW EXECUTE FUNCTION payment_refunds_frozen();
 
+-- 付款额度预留指令（两阶段付款）：财务凭"权利人编号 + 唯一指令号 + 正整数分额"
+-- 先预留额度（pending）；银行实付后提交外部付款流水号确认，原子登记付款并结束
+-- 预留（confirmed）；付款前也可取消（cancelled，释放额度）。
+-- 仅 pending 指令参与"可用额 = 当前余额 - 全部待确认预留"的扣减；
+-- instruction_ref 全局唯一：同号同内容重试幂等返回原指令，同号异内容拒绝；
+-- payment_id 一对一关联确认时登记的付款（与付款流水号共同保证确认幂等）。
+CREATE TABLE IF NOT EXISTS payment_instructions (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    instruction_ref text NOT NULL UNIQUE,
+    holder_code     text NOT NULL REFERENCES rightsholders(code),
+    amount          bigint NOT NULL CHECK (amount > 0),
+    status          text NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'confirmed', 'cancelled')),
+    payment_id      bigint UNIQUE REFERENCES payments(id),
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    confirmed_at    timestamptz,
+    cancelled_at    timestamptz
+);
+-- 按权利人列指令（对账单主索引）
+CREATE INDEX IF NOT EXISTS payment_instructions_holder_idx
+    ON payment_instructions(holder_code, id);
+-- 待确认预留汇总与"更早创建的待确认指令"判定主索引（部分索引，仅 pending）
+CREATE INDEX IF NOT EXISTS payment_instructions_pending_idx
+    ON payment_instructions(holder_code, id) WHERE status = 'pending';
+
+-- 历史不可变 + 状态机保护：指令一经创建，编号/权利人/金额/创建时间恒不可改、
+-- 不可删除；仅允许 pending -> confirmed（须绑定 payment_id、置 confirmed_at）
+-- 或 pending -> cancelled（不得绑定付款、置 cancelled_at）这一次迁移。
+-- 负额追补导致确认被拒时应用层不发起 UPDATE，指令保持 pending 不变。
+CREATE OR REPLACE FUNCTION payment_instructions_guarded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'payment instructions are append-only and must not be deleted';
+    END IF;
+    IF OLD.status = 'pending'
+       AND NEW.status IN ('confirmed', 'cancelled')
+       AND NEW.id = OLD.id
+       AND NEW.instruction_ref = OLD.instruction_ref
+       AND NEW.holder_code = OLD.holder_code
+       AND NEW.amount = OLD.amount
+       AND NEW.created_at = OLD.created_at
+       AND (
+           (NEW.status = 'confirmed'
+                AND NEW.payment_id IS NOT NULL
+                AND NEW.confirmed_at IS NOT NULL
+                AND NEW.cancelled_at IS NULL)
+           OR
+           (NEW.status = 'cancelled'
+                AND NEW.payment_id IS NULL
+                AND NEW.cancelled_at IS NOT NULL
+                AND NEW.confirmed_at IS NULL)
+       )
+    THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'payment instructions are immutable except the single '
+                  || 'pending -> confirmed/cancelled transition';
+END;
+$$;
+DROP TRIGGER IF EXISTS payment_instructions_guarded_trg ON payment_instructions;
+CREATE TRIGGER payment_instructions_guarded_trg
+    BEFORE UPDATE OR DELETE ON payment_instructions
+    FOR EACH ROW EXECUTE FUNCTION payment_instructions_guarded();
+
 -- 单据的可追溯性标记：traceable（本轮起出具、带逐笔证据）；
 -- legacy_untraceable（升级前已存在、只有汇总明细行、无法逐笔追溯的存量单据）
 ALTER TABLE statement_batches

@@ -304,6 +304,20 @@ class LedgerRefundItem(BaseModel):
     registered_at: datetime
 
 
+# 付款预留指令条目（对账单可见待确认预留与全部指令状态，历史指令不可改写）
+class LedgerInstructionItem(BaseModel):
+    instruction_id: int
+    instruction_ref: str
+    amount: int
+    # pending | confirmed | cancelled
+    status: str
+    payment_id: int | None = None
+    payment_ref: str | None = None
+    created_at: datetime
+    confirmed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+
+
 class HolderLedger(BaseModel):
     holder_code: str
     name: str | None
@@ -316,10 +330,16 @@ class HolderLedger(BaseModel):
     # 当前余额 = billed_total - paid_total + refunded_total
     # （可为负：跨期负额追补后留待后续抵扣；退回只加回余额，不改变可负性）
     balance: int
+    # 待确认预留（pending 指令）合计
+    reserved_total: int = 0
+    # 可用额 = balance - reserved_total（新付款与新预留均须在此额度内）
+    available: int = 0
     statements: list[LedgerStatementItem]
     payments: list[LedgerPaymentItem]
     # 逐笔银行退回（原付款与单据不可变，退回只追加）
     refunds: list[LedgerRefundItem]
+    # 全部付款预留指令及状态（历史指令不可改写）
+    payment_instructions: list[LedgerInstructionItem] = []
 
 
 # ---- 银行退票（付款退回）登记 ----
@@ -352,6 +372,97 @@ class RefundOut(BaseModel):
     status: str
     # 登记后余额（重试时为当前余额）
     balance_after: int
+
+
+# ---- 付款额度预留指令（两阶段付款） ----
+
+class InstructionReserveIn(BaseModel):
+    # 权利人编号（须已建档；不存在 404 holder_not_found）
+    holder_code: str = Field(min_length=1, max_length=200)
+    # 唯一指令号（调用方提供，全局唯一；同内容重试幂等、异内容 409）
+    instruction_ref: str = Field(min_length=1, max_length=200)
+    # 正整数分额（最小货币单位）；须不超过当时可用额
+    amount: int = Field(strict=True, ge=1)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def reject_bool_amount(cls, v):
+        # JSON 的 true/false 虽是 int 子类，但不是合法金额
+        if isinstance(v, bool):
+            raise ValueError("amount must be an integer, not boolean")
+        return v
+
+
+class InstructionConfirmIn(BaseModel):
+    # 外部付款流水号（全局唯一；同流水号确认重试幂等，异流水号/被占用 409）
+    external_ref: str = Field(min_length=1, max_length=200)
+
+
+# 指令本身的字段（生命周期状态 + 绑定的付款）
+class InstructionBase(BaseModel):
+    instruction_id: int
+    instruction_ref: str
+    holder_code: str
+    amount: int
+    # pending=待确认预留；confirmed=已确认（已登记付款）；cancelled=已取消
+    instruction_status: str
+    payment_id: int | None = None
+    payment_ref: str | None = None
+    created_at: datetime
+    confirmed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+
+
+class InstructionOut(InstructionBase):
+    # 请求结果：created=新建预留；duplicate=同号同内容重试，返回原指令
+    status: str
+    # 返回时的当前余额、待确认预留合计与可用额（可用额 = 余额 - 待确认预留）
+    balance: int
+    reserved_total: int
+    available: int
+
+
+class InstructionDetail(InstructionBase):
+    # 查询单个指令：仅生命周期状态与当时余额/可用额
+    balance: int
+    reserved_total: int
+    available: int
+
+
+class InstructionCancelOut(InstructionBase):
+    # cancelled=本次取消；duplicate=对已取消指令重复取消（幂等）
+    status: str
+    balance: int
+    reserved_total: int
+    available: int
+
+
+class InstructionPaymentOut(BaseModel):
+    # 确认时登记/命中的付款记录（字段与 POST /payments 输出保持一致）
+    payment_id: int
+    holder_code: str
+    external_ref: str
+    amount: int
+    registered_at: datetime
+
+
+class InstructionConfirmOut(BaseModel):
+    instruction_id: int
+    instruction_ref: str
+    holder_code: str
+    amount: int
+    instruction_status: str  # confirmed
+    payment: InstructionPaymentOut
+    confirmed_at: datetime
+    # 与 PaymentOut 同口径的顶层付款字段
+    payment_id: int
+    external_ref: str
+    registered_at: datetime
+    # 登记后余额；可用额 = 余额 - 其余待确认预留（本指令已结束预留）
+    balance_after: int
+    available_after: int
+    # created=本次原子登记新付款；duplicate=同流水号确认重试，返回原付款
+    status: str
 
 
 # ---- 银行回单批次导入与付款核验 ----

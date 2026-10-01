@@ -18,6 +18,8 @@ import hashlib
 
 # 付款流水号咨询锁命名空间
 _PAYMENT_REF_NS = 0x50415931  # "PAY1"
+# 付款预留指令号咨询锁命名空间（instructions_service 复用同一命名空间约定）
+INSTRUCTION_REF_NS = 0x50494E31  # "PIN1"
 
 
 def _combined_key(namespace: int, key: int) -> int:
@@ -77,6 +79,34 @@ def get_balance(conn, holder_code: str) -> int:
     )
 
 
+# 全部待确认预留指令的分额合计：仅 status='pending' 占用可用额，
+# 已确认的已转为实际付款（payments 中扣减），已取消的不再占用。
+_PENDING_RESERVED_SQL = """
+SELECT COALESCE(SUM(amount), 0) AS reserved
+FROM payment_instructions
+WHERE holder_code = %s AND status = 'pending'
+"""
+
+
+def pending_reserved_total(conn, holder_code: str, *, before_id: int | None = None) -> int:
+    """待确认预留合计；before_id 给定（如待确认的本指令自身 id）时只计更早创建的指令。
+
+    "更早创建"按指令 id（即创建次序，与 created_at 同序）严格小于判定。
+    确认指令做负额追补防护时，必须为这些更早的 pending 指令留足额度。
+    """
+    sql = _PENDING_RESERVED_SQL
+    params: tuple = (holder_code,)
+    if before_id is not None:
+        sql += " AND id < %s"
+        params = (holder_code, before_id)
+    return int(conn.execute(sql, params).fetchone()["reserved"])
+
+
+def get_available(conn, holder_code: str) -> int:
+    """可用额 = 当前余额 - 全部待确认预留（可为负：负额追补后余额被冲减）。"""
+    return get_balance(conn, holder_code) - pending_reserved_total(conn, holder_code)
+
+
 def lock_holders_for_billing(conn, holder_codes) -> None:
     """出单侧调用：按编号升序逐个锁定本次受影响的权利人，再写单据明细。
 
@@ -97,8 +127,10 @@ def register_payment(conn, holder_code: str, external_ref: str, amount: int) -> 
     - 权利人不存在：404 holder_not_found，不留付款；
     - 同一流水号同内容重试：返回原付款记录与登记后余额（幂等）；
     - 同一流水号异内容（权利人或金额不同）：409 payment_ref_conflict；
-    - 当前正余额不足（余额 <= 0 或 amount > balance）：
+    - 当前正可用额不足（可用额 <= 0 或 amount > 可用额）：
       409 payment_exceeds_balance，拒绝且不留付款。
+      可用额 = 当前余额 - 全部待确认预留：原"不超过正余额"的超额拒绝约定保持
+      兼容（错误码、balance 字段不变），新付款同时避开待确认预留额度。
     """
     with conn.transaction():
         # 先按流水号加锁：并发的同流水号请求在此串行化，
@@ -128,7 +160,8 @@ def register_payment(conn, holder_code: str, external_ref: str, amount: int) -> 
                 "balance_after": get_balance(conn, existing["holder_code"]),
             }
 
-        # 锁定权利人行：与出单侧行锁互斥；权利人不存在则 404。
+        # 锁定权利人行：与出单侧行锁、预留/确认/取消持有的行锁互斥；
+        # 权利人不存在则 404。
         holder = conn.execute(
             "SELECT code FROM rightsholders WHERE code = %s FOR UPDATE",
             (holder_code,),
@@ -137,8 +170,11 @@ def register_payment(conn, holder_code: str, external_ref: str, amount: int) -> 
             raise _holder_not_found(holder_code)
 
         balance = get_balance(conn, holder_code)
-        if balance <= 0 or amount > balance:
-            raise _exceeds_balance(holder_code, amount, balance)
+        reserved = pending_reserved_total(conn, holder_code)
+        available = balance - reserved
+        # 新付款须避开待确认预留：仍只允许在正的可用额内入账
+        if available <= 0 or amount > available:
+            raise _exceeds_balance(holder_code, amount, balance, reserved, available)
 
         row = conn.execute(
             """
@@ -184,18 +220,30 @@ def _conflict(external_ref: str, existing) -> "object":
     )
 
 
-def _exceeds_balance(holder_code: str, amount: int, balance: int):
+def _exceeds_balance(
+    holder_code: str,
+    amount: int,
+    balance: int,
+    reserved: int = 0,
+    available: int | None = None,
+):
     from .errors import APIError
 
+    if available is None:
+        available = balance - reserved
     return APIError(
         409,
         "payment_exceeds_balance",
-        f"payment amount {amount} exceeds current positive balance {balance} "
-        f"of rightsholder {holder_code}; payment rejected",
+        f"payment amount {amount} exceeds current available balance {available} "
+        f"of rightsholder {holder_code} (balance {balance}, pending reservations "
+        f"{reserved}); payment rejected",
         detail={
             "holder_code": holder_code,
             "requested_amount": amount,
             "balance": balance,
+            # 新增字段（向后兼容，原有 balance 约定不变）
+            "pending_reserved": reserved,
+            "available": available,
         },
     )
 
@@ -243,9 +291,27 @@ def get_holder_ledger(conn, holder_code: str):
         (holder_code,),
     ).fetchall()
 
+    instruction_rows = conn.execute(
+        """
+        SELECT i.id, i.instruction_ref, i.amount, i.status, i.created_at,
+               i.confirmed_at, i.cancelled_at, i.payment_id,
+               p.external_ref AS payment_ref
+        FROM payment_instructions i
+        LEFT JOIN payments p ON p.id = i.payment_id
+        WHERE i.holder_code = %s
+        ORDER BY i.id
+        """,
+        (holder_code,),
+    ).fetchall()
+
     billed_total = sum(int(r["amount"]) for r in statement_rows)
     paid_total = sum(int(r["amount"]) for r in payment_rows)
     refunded_total = sum(int(r["amount"]) for r in refund_rows)
+    balance = billed_total - paid_total + refunded_total
+    # 仅待确认预留占用可用额；已确认的预留已转为实际付款（计入 paid_total）
+    reserved_total = sum(
+        int(r["amount"]) for r in instruction_rows if r["status"] == "pending"
+    )
 
     return {
         "holder_code": holder["code"],
@@ -253,7 +319,10 @@ def get_holder_ledger(conn, holder_code: str):
         "billed_total": billed_total,
         "paid_total": paid_total,
         "refunded_total": refunded_total,
-        "balance": billed_total - paid_total + refunded_total,
+        "balance": balance,
+        # 待确认预留合计与可用额（可用额 = 余额 - 待确认预留，可为负）
+        "reserved_total": reserved_total,
+        "available": balance - reserved_total,
         "statements": [
             {
                 "batch_id": r["batch_id"],
@@ -284,5 +353,19 @@ def get_holder_ledger(conn, holder_code: str):
                 "registered_at": r["created_at"],
             }
             for r in refund_rows
+        ],
+        "payment_instructions": [
+            {
+                "instruction_id": r["id"],
+                "instruction_ref": r["instruction_ref"],
+                "amount": int(r["amount"]),
+                "status": r["status"],
+                "payment_id": r["payment_id"],
+                "payment_ref": r["payment_ref"],
+                "created_at": r["created_at"],
+                "confirmed_at": r["confirmed_at"],
+                "cancelled_at": r["cancelled_at"],
+            }
+            for r in instruction_rows
         ],
     }
